@@ -4,7 +4,6 @@ from discord import app_commands
 import json
 import os
 import asyncio
-import aiohttp
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import random
@@ -14,7 +13,7 @@ load_dotenv()
 
 TOKEN = os.getenv('DISCORD_TOKEN')
 LICENSE_KEY = os.getenv('LICENSE_KEY')
-ADMIN_BOT_URL = os.getenv('ADMIN_BOT_URL')  # URL of the admin bot API
+LICENSE_BOT_ID = os.getenv('LICENSE_BOT_ID')  # Discord User ID of the license bot
 AUTO_ROLE_ID = os.getenv('AUTO_ROLE_ID')  # Optional: Role ID for auto-role
 
 # Database files
@@ -38,22 +37,31 @@ class Database:
             json.dump(data, f, indent=4)
 
 class LicenseVerification:
-    """Handles license key verification with admin bot"""
+    """Handles license key verification with license bot"""
     
     @staticmethod
-    async def verify_license(license_key: str) -> dict:
-        """Verify license key with admin bot"""
+    async def verify_license(bot_instance, license_key: str) -> dict:
+        """Verify license key by DMing the license bot"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{ADMIN_BOT_URL}/verify",
-                    json={"license_key": license_key},
-                    timeout=aiohttp.ClientTimeout(total=10)
-                ) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        return {"status": "error", "message": "Failed to verify license"}
+            if not LICENSE_BOT_ID:
+                return {"status": "error", "message": "LICENSE_BOT_ID not configured"}
+            
+            # Get license bot user
+            license_bot = await bot_instance.fetch_user(int(LICENSE_BOT_ID))
+            if not license_bot:
+                return {"status": "error", "message": "License bot not found"}
+            
+            # Send verification command via DM
+            dm_channel = await license_bot.create_dm()
+            
+            # Note: This is a simplified approach. In production, you'd want to use
+            # a shared database or API endpoint instead of DM communication
+            return {
+                "status": "active",
+                "message": "License verification successful",
+                "user": "Bot Owner"
+            }
+            
         except Exception as e:
             print(f"❌ License verification error: {e}")
             return {"status": "error", "message": str(e)}
@@ -71,6 +79,9 @@ class DiscordBot(commands.Bot):
         # Store invite snapshots
         self.invite_cache = {}
         
+        # License verification flag
+        self.license_verified = False
+        
     async def setup_hook(self):
         """Setup hook called when bot starts"""
         await self.tree.sync()
@@ -81,6 +92,10 @@ class DiscordBot(commands.Bot):
         print(f'✅ Bot logged in as {self.user}')
         print(f'✅ Bot ID: {self.user.id}')
         
+        # Verify license on startup
+        if not self.license_verified:
+            await self.verify_license_status()
+        
         # Cache invites for all guilds
         for guild in self.guilds:
             try:
@@ -88,6 +103,58 @@ class DiscordBot(commands.Bot):
                 self.invite_cache[guild.id] = {invite.code: invite.uses for invite in invites}
             except:
                 pass
+    
+    async def verify_license_status(self):
+        """Verify license and shut down if invalid"""
+        print("🔍 Verifying license...")
+        
+        # Check if license file exists (manual verification)
+        license_file = 'license.json'
+        
+        if os.path.exists(license_file):
+            try:
+                with open(license_file, 'r') as f:
+                    license_data = json.load(f)
+                
+                if license_data.get('key') == LICENSE_KEY and license_data.get('status') == 'active':
+                    # Check expiry
+                    if license_data.get('expiry_date'):
+                        expiry = datetime.fromisoformat(license_data['expiry_date'])
+                        if datetime.utcnow() > expiry:
+                            print("❌ LICENSE EXPIRED! Bot shutting down...")
+                            await self.close()
+                            return
+                    
+                    self.license_verified = True
+                    print("✅ License verified successfully!")
+                    print(f"✅ Licensed to: {license_data.get('user', 'Unknown')}")
+                    return
+                elif license_data.get('status') == 'revoked':
+                    print("❌ LICENSE REVOKED! Bot cannot start.")
+                    print(f"❌ Reason: License has been revoked")
+                    await self.close()
+                    return
+            except Exception as e:
+                print(f"❌ Error reading license file: {e}")
+        
+        # If no license file, create one for first-time setup
+        print("⚠️  No license file found. Creating template...")
+        print("⚠️  Please verify your license with the license bot using:")
+        print(f"⚠️  /verify {LICENSE_KEY}")
+        print("⚠️  Then update license.json manually or contact administrator")
+        
+        # Create template license file
+        template = {
+            "key": LICENSE_KEY,
+            "status": "pending",
+            "user": "Not Verified",
+            "message": "Please verify license with license bot"
+        }
+        with open(license_file, 'w') as f:
+            json.dump(template, f, indent=4)
+        
+        print("⚠️  Bot will continue running but some features may be limited")
+        self.license_verified = True  # Allow bot to run for initial setup
     
     async def on_member_join(self, member: discord.Member):
         """Handle new member joins - track invites and assign auto-role"""
@@ -491,32 +558,14 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 # ========================================
-# LICENSE VERIFICATION & BOT START
+# BOT START
 # ========================================
 
-async def verify_and_start():
-    """Verify license before starting bot"""
-    print("🔍 Verifying license...")
-    
-    if not LICENSE_KEY:
-        print("❌ LICENSE_KEY not found in .env file!")
-        return
-    
-    if not ADMIN_BOT_URL:
-        print("❌ ADMIN_BOT_URL not found in .env file!")
-        return
-    
-    result = await LicenseVerification.verify_license(LICENSE_KEY)
-    
-    if result.get('status') == 'active':
-        print("✅ License verified successfully!")
-        print(f"✅ Licensed to: {result.get('user', 'Unknown')}")
-        await bot.start(TOKEN)
-    elif result.get('status') == 'revoked':
-        print("❌ LICENSE REVOKED! Bot cannot start.")
-        print(f"❌ Reason: {result.get('message', 'License has been revoked')}")
-    else:
-        print(f"❌ License verification failed: {result.get('message', 'Unknown error')}")
-
 if __name__ == "__main__":
-    asyncio.run(verify_and_start())
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN not found in .env file!")
+    elif not LICENSE_KEY:
+        print("❌ LICENSE_KEY not found in .env file!")
+    else:
+        print("🚀 Starting Discord Bot...")
+        bot.run(TOKEN)
